@@ -1,0 +1,77 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nfa-agent-api
+  namespace: default
+  labels:
+    app: nfa-agent-api
+  annotations:
+    secrets.doppler.com/reload: "true"
+spec:
+  replicas: __API_REPLICAS__
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 1
+  selector:
+    matchLabels:
+      app: nfa-agent-api
+  template:
+    metadata:
+      labels:
+        app: nfa-agent-api
+    spec:
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: nfa-agent-api
+          image: "{{BASE_REPOSITORY}}/nfa-agent-api:{{SHORTHASH}}"
+          envFrom:
+            - secretRef:
+                name: nfa-agent-staging
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 3005
+          args: ["yarn", "start"]
+          readinessProbe:
+            httpGet:
+              path: /healthcheck
+              port: 3005
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            successThreshold: 2
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /healthcheck
+              port: 3005
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 10"]
+          resources:
+            limits:
+              cpu: 500m
+              memory: 1Gi
+            requests:
+              cpu: 200m
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nfa-agent-api
+  annotations:
+    alb.ingress.kubernetes.io/healthcheck-path: /healthcheck
+spec:
+  type: NodePort
+  ports:
+    - port: 3005
+      name: nfa-agent-api
+  selector:
+    app: nfa-agent-api

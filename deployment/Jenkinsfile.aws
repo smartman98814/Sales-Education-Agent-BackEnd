@@ -1,0 +1,136 @@
+pipeline {
+  agent any
+  environment {
+    SHORTHASH = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+    APP_ENV = ''
+  }
+  stages {
+    stage('Get Env') {
+      steps {
+        script {
+          def BRANCH = env.BRANCH_NAME
+          // Conditional assignment based on Git branch for APP_ENV
+          if (BRANCH == 'main') {
+            APP_ENV = 'prod'
+          } else if (BRANCH == 'staging') {
+            APP_ENV = 'staging'
+          } else {
+            echo "Unsupported branch: ${BRANCH}"
+            error("Unsupported branch: ${BRANCH}")
+          }
+        }
+      }
+    }
+
+    stage('Prepare AWS env') {
+      steps {
+        catchError(buildResult: 'FAILURE') {
+          withCredentials([string(credentialsId: 'aws-docker-repository', variable: 'REPOSITORY')]) {
+            sh 'docker system prune -f'
+            sh "aws ecr get-login-password --region ap-southeast-1 --profile pivotal | docker login --username AWS --password-stdin ${REPOSITORY}"
+            script {
+              def eksClusterName = (APP_ENV == 'staging') ? 'allinone-staging' : "agent-bento-${APP_ENV}"
+              sh "aws eks update-kubeconfig --name ${eksClusterName} --region ap-southeast-1 --profile pivotal"
+            }
+          }
+        }
+      }
+    }
+
+    stage('Build & Push') {
+      steps {
+        catchError(buildResult: 'FAILURE') {
+          withCredentials([string(credentialsId: 'aws-docker-repository', variable: 'REPOSITORY')]) {
+            sh "docker build --platform=linux/amd64 -t agent-bento-api:\"$SHORTHASH\" -f deployment/Dockerfile ."
+            sh "docker tag agent-bento-api:\"$SHORTHASH\" ${REPOSITORY}/agent-bento-api:\"$SHORTHASH\""
+            sh "docker push ${REPOSITORY}/agent-bento-api:\"$SHORTHASH\""
+          }
+        }
+      }
+    }
+
+    // Done by doppler
+    // stage('Load environment variables') {
+    //   steps {
+    //     script {
+    //       catchError(buildResult: 'FAILURE') {
+    //         def configMapName = 'pivotal-env'
+    //         // Check if the ConfigMap exists
+    //         def configMapExists = sh(script: "kubectl get configmap ${configMapName} -o name", returnStatus: true)
+
+    //         if (configMapExists == 0) {
+    //           // ConfigMap exists, so delete it
+    //           sh "kubectl delete configmap ${configMapName}"
+    //         } else {
+    //           echo "ConfigMap ${configMapName} does not exist, skipping deletion."
+    //         }
+
+    //         sh """
+    //           kubectl create configmap ${configMapName} --from-env-file=/var/lib/jenkins/project/agent-bento-api/.env.${APP_ENV}
+    //           kubectl get configmap ${configMapName} -o yaml > ${configMapName}.yaml
+    //           kubectl apply -f ${configMapName}.yaml
+    //         """
+    //       }
+    //     }
+    //   }
+    // }
+
+    stage('Deploy') {
+      steps {
+        catchError(buildResult: 'FAILURE') {
+          withCredentials([
+            string(credentialsId: 'aws-docker-repository', variable: 'REPOSITORY'),
+            string(credentialsId: "api-replicas-${APP_ENV}", variable: 'API_REPLICAS'),
+            string(credentialsId: "worker-replicas-${APP_ENV}", variable: 'WORKER_REPLICAS')
+          ]) {
+            sh """
+              cat deployment/${APP_ENV}/deployment.yaml | sed -e 's/{{REPOSITORY}}/${BASE_REPOSITORY}/g' -e 's/{{SHORTHASH}}/${SHORTHASH}/g' -e 's/__API_REPLICAS__/${API_REPLICAS}/g' -e 's/__WORKER_REPLICAS__/${WORKER_REPLICAS}/g' | kubectl apply -f -
+            """
+          }
+        }
+      }
+    }
+
+    stage('Notify Slack') {
+      steps {
+        script {
+          def slackChannel = '#dev-feed'
+          def slackMessage
+          def prettyAppEnv = (APP_ENV == 'prod') ? 'PRODUCTION' : (APP_ENV == 'staging') ? 'STAGING' : 'Unknown'
+
+          if (currentBuild.resultIsBetterOrEqualTo('SUCCESS')) {
+            slackMessage = "<!channel> *AgentBento.com* - ${prettyAppEnv} API is successfully deployed.\n${env.BUILD_URL}"
+          } else {
+            slackMessage = "<!channel> *AgentBento.com* - ${prettyAppEnv} API is failed.\n${env.BUILD_URL}"
+          }
+
+          def attachments = [
+            [
+              text: slackMessage,
+              fallback: slackMessage,
+              color: currentBuild.resultIsBetterOrEqualTo('SUCCESS') ? 'good' : 'danger'
+            ]
+          ]
+
+          slackSend(channel: slackChannel, attachments: attachments)
+        }
+      }
+    }
+  }
+
+  post {
+    failure {
+      script {
+        def attachments = [
+          [
+          text: slackMessage = "<!channel> *AgentBento.com* - ${prettyAppEnv} API deploy is failed.\n${env.BUILD_URL}",
+          fallback: slackMessage = "<!channel> *AgentBento.com* - ${prettyAppEnv} API deploy is failed.\n${env.BUILD_URL}",
+          color: 'danger'
+          ]
+        ]
+        currentBuild.result = 'FAILURE'
+        slackSend(channel: slackChannel, attachments: attachments)
+      }
+    }
+  }
+}
